@@ -32,14 +32,46 @@ def declare_methods(data):
 
 def make_operator(rule):
 	def operator(state, ID):
-		# your code here
-		pass
+		# Check time first
+		if state.time[ID] < rule['Time']:
+			return False
+
+		# Check required tools (not consumed)
+		requires = rule.get('Requires', {})
+		for item, num in requires.items():
+			if getattr(state, item)[ID] < num:
+				return False
+
+		# Check consumed inputs
+		consumes = rule.get('Consumes', {})
+		for item, num in consumes.items():
+			if getattr(state, item)[ID] < num:
+				return False
+
+		# Apply effects: consume inputs
+		for item, num in consumes.items():
+			getattr(state, item)[ID] -= num
+
+		# Apply effects: produce outputs
+		for item, num in rule['Produces'].items():
+			getattr(state, item)[ID] += num
+
+		# Deduct time cost
+		state.time[ID] -= rule['Time']
+		return state
 	return operator
 
 def declare_operators(data):
 	# your code here
 	# hint: call make_operator, then declare the operator to pyhop using pyhop.declare_operators(o1, o2, ..., ok)
-	pass
+	ops = []
+	for name, rule in data['Recipes'].items():
+		op = make_operator(rule)
+		normalized = name.replace(' ', '_').replace('-', '_')
+		normalized = normalized.replace('(', '').replace(')', '').replace(',', '')
+		op.__name__ = f"op_{normalized}"
+		ops.append(op)
+	pyhop.declare_operators(*ops)
 
 def add_heuristic(data, ID):
 	# prune search branch if heuristic() returns True
@@ -98,7 +130,7 @@ if __name__ == '__main__':
 	add_heuristic(data, 'agent')
 	define_ordering(data, 'agent')
 
-	# pyhop.print_operators()
+	#pyhop.print_operators()
 	# pyhop.print_methods()
 
 	# Hint: verbose output can take a long time even if the solution is correct; 
