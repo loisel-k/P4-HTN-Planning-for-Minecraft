@@ -23,7 +23,6 @@ def make_method(name, rule):
 		return None
 	# product name and quantity
 	prod_item = list(produces.keys())[0]
-	prod_qty = produces[prod_item]
 
 	# normalize recipe name to match operator naming in declare_operators
 	normalized = name.replace(' ', '_').replace('-', '_')
@@ -36,7 +35,6 @@ def make_method(name, rule):
 		for tool, n in rule.get('Requires', {}).items():
 			subtasks.append(('have_enough', ID, tool, n))
 		# Ensure consumed inputs are available (produce them as needed)
-		# Order input 
 		for item, n in rule.get('Consumes', {}).items():
 			subtasks.append(('have_enough', ID, item, n))
 		# Perform operator to produce item!
@@ -45,6 +43,8 @@ def make_method(name, rule):
 
 	# Name the method as assignment lays out
 	method.__name__ = f"produce_{prod_item}__via__{normalized}"
+	method._rule = rule
+	method._produces = prod_item
 	return method
 
 def declare_methods(data):
@@ -61,7 +61,10 @@ def declare_methods(data):
 			continue
 		prod_item = list(produces.keys())[0]
 		prod_to_methods.setdefault(prod_item, [])
-		prod_to_methods[prod_item].append((m, rule.get('Time', 0)))
+		time_cost = rule.get('Time', 0)
+		qty = produces[prod_item]
+		time_per_unit = time_cost / float(qty) if qty else time_cost
+		prod_to_methods[prod_item].append((m, time_per_unit))
 
 	# Declare methods to pyhop, ordering by recipe time (fastest first)
 	for prod_item, methods_and_times in prod_to_methods.items():
@@ -116,32 +119,56 @@ def add_heuristic(data, ID):
 	# prune search branch if heuristic() returns True
 	# do not change parameters to heuristic(), but can add more heuristic functions with the same parameters: 
 	# e.g. def heuristic2(...); pyhop.add_check(heuristic2)
+	min_time_per_unit = {}
+	base_producible = set()
+	for _, rule in data.get('Recipes', {}).items():
+		produces = rule.get('Produces', {})
+		if not produces:
+			continue
+		item = list(produces.keys())[0]
+		qty = produces[item]
+		time_cost = rule.get('Time', 0)
+		time_per_unit = time_cost / float(qty) if qty else time_cost
+		if item not in min_time_per_unit or time_per_unit < min_time_per_unit[item]:
+			min_time_per_unit[item] = time_per_unit
+		if not rule.get('Requires') and not rule.get('Consumes'):
+			base_producible.add(item)
+	tools_set = set(data.get('Tools', []))
+
 	def heuristic(state, curr_task, tasks, plan, depth, calling_stack):
-		# Prevent simple infinite recursion: if we're trying to produce an item
-		# that's already on the calling stack as a produce request, prune.
-		# curr_task may be like ('produce', ID, item) or ('have_enough', ID, item, num)
-		try:
-			tname = curr_task[0]
-		except Exception:
+		if not isinstance(curr_task, (list, tuple)) or not curr_task:
 			return False
+		tname = curr_task[0]
 
-		# find the target item if this is a produce/have_enough call
-		target_item = None
+		# Cycle check: prune direct self-recursion for non-base items
 		if tname == 'produce' and len(curr_task) >= 3:
-			target_item = curr_task[2]
-		elif tname == 'have_enough' and len(curr_task) >= 4:
-			target_item = curr_task[2]
+			item = curr_task[2]
+			if calling_stack:
+				last = calling_stack[-1]
+				if isinstance(last, (list, tuple)) and len(last) >= 3 and last[0] == 'produce' and last[2] == item:
+					if item not in base_producible:
+						return True
+			# Avoid making extra tools when one already exists
+			if item in tools_set and getattr(state, item)[ID] >= 1:
+				return True
 
-		if target_item is not None:
-			# if another produce/have_enough for same item exists in the calling stack, prune
-			for t in calling_stack:
-				if not isinstance(t, (list, tuple)):
-					continue
-				if len(t) >= 3 and (t[0] == 'produce' or t[0] == 'have_enough') and t[2] == target_item:
+		# Time feasibility check for have_enough
+		if tname == 'have_enough' and len(curr_task) >= 4:
+			item = curr_task[2]
+			num = curr_task[3]
+			current = getattr(state, item)[ID]
+			if current >= num:
+				return False
+			if state.time[ID] <= 0:
+				return True
+			time_per_unit = min_time_per_unit.get(item)
+			if time_per_unit is not None:
+				needed = num - current
+				if needed * time_per_unit > state.time[ID]:
 					return True
 
-		# Simple depth cap to avoid insane recursion (safeguard)
-		if depth > 30:
+		# Simple depth cap to avoid extreme recursion
+		if depth > 120:
 			return True
 
 		return False # if True, prune this branch
@@ -152,7 +179,52 @@ def define_ordering(data, ID):
 	# if needed, use the function below to return a different ordering for the methods
 	# note that this should always return the same methods, in a new order, and should not add/remove any new ones
 	def reorder_methods(state, curr_task, tasks, plan, depth, calling_stack, methods):
-		return methods
+		target_item = None
+		if isinstance(curr_task, (list, tuple)) and curr_task:
+			if isinstance(curr_task[0], str) and curr_task[0].startswith('produce_'):
+				target_item = curr_task[0][len('produce_'):]
+		scored = []
+		fallback = []
+		for m in methods:
+			rule = getattr(m, '_rule', None)
+			if rule is None:
+				fallback.append(m)
+				continue
+			produces = rule.get('Produces', {})
+			if not produces:
+				fallback.append(m)
+				continue
+			item = list(produces.keys())[0]
+			qty = produces[item]
+			time_cost = rule.get('Time', 0)
+			time_per_unit = time_cost / float(qty) if qty else time_cost
+			unmet_tools = 0
+			tool_priority = 0
+			for tool, n in rule.get('Requires', {}).items():
+				if getattr(state, tool)[ID] < n:
+					unmet_tools += 1
+					if target_item in {'cobble', 'coal', 'ore'}:
+						if tool == 'wooden_pickaxe':
+							tool_priority = max(tool_priority, 0)
+						elif tool == 'stone_pickaxe':
+							tool_priority = max(tool_priority, 1)
+						elif tool == 'iron_pickaxe':
+							tool_priority = max(tool_priority, 2)
+						else:
+							tool_priority = max(tool_priority, 3)
+			if target_item in {'cobble', 'coal', 'ore'}:
+				scored.append((unmet_tools, tool_priority, time_per_unit, m))
+			else:
+				scored.append((unmet_tools, time_per_unit, m))
+		# If any method can run immediately (no missing tools), prefer only those for resource gathering
+		if target_item in {'wood', 'cobble', 'coal', 'ore'} and scored:
+			if any((s[0] == 0) for s in scored):
+				scored = [s for s in scored if s[0] == 0]
+		if target_item in {'cobble', 'coal', 'ore'}:
+			scored.sort(key=lambda x: (x[0], x[1], x[2]))
+			return [s[3] for s in scored] + fallback
+		scored.sort(key=lambda x: (x[0], x[1]))
+		return [s[2] for s in scored] + fallback
 	
 	pyhop.define_ordering(reorder_methods)
 
