@@ -110,116 +110,135 @@ def declare_operators(data):
 	pyhop.declare_operators(*ops)
 
 def add_heuristic(data, ID):
-    # Compute min time/unit for each item
+    # Min time per unit for reachability pruning
     min_time_per_unit = {}
-    base_producible = set()
     for _, rule in data.get('Recipes', {}).items():
-        produces = rule.get('Produces', {})
-        if not produces:
-            continue
-        item = list(produces.keys())[0]
-        qty = produces[item]
-        time_cost = rule.get('Time', 0)
-        time_per_unit = time_cost / float(qty) if qty else time_cost
-        if item not in min_time_per_unit or time_per_unit < min_time_per_unit[item]:
-            min_time_per_unit[item] = time_per_unit
-        if not rule.get('Requires') and not rule.get('Consumes'):
-            base_producible.add(item)
-    tools_set = set(data.get('Tools', []))
+        for item, qty in rule.get('Produces', {}).items():
+            t = rule.get('Time', 0)
+            tpu = t / float(qty) if qty else t
+            min_time_per_unit[item] = min(min_time_per_unit.get(item, float('inf')), tpu)
+
+    tools = set(data.get('Tools', []))
+
+    # Precompute which tools are ever required
+    tool_required_by = {t: set() for t in tools}
+    for name, rule in data.get('Recipes', {}).items():
+        for t in rule.get('Requires', {}):
+            tool_required_by[t].add(name)
 
     def heuristic(state, curr_task, tasks, plan, depth, calling_stack):
-        if not isinstance(curr_task, (list, tuple)) or not curr_task:
+        if not isinstance(curr_task, (list, tuple)):
             return False
+
         tname = curr_task[0]
 
-        # Avoid infinite recursion: only prune self-recursion for non-base items
+        # ---- HARD RULE: never remake a tool we already have ----
         if tname == 'produce' and len(curr_task) >= 3:
             item = curr_task[2]
-            if calling_stack:
-                last = calling_stack[-1]
-                if isinstance(last, (list, tuple)) and len(last) >= 3 and last[0] == 'produce' and last[2] == item:
-                    if item not in base_producible:
-                        return True
-            # Avoid producing tools we already have
-            if item in tools_set and getattr(state, item)[ID] >= 1:
+            if item in tools and getattr(state, item)[ID] >= 1:
                 return True
 
-        # Prune impossible time
-        if tname == 'have_enough' and len(curr_task) >= 4:
+        # ---- Prevent tool recursion chains ----
+        if calling_stack and tname == 'produce' and len(curr_task) >= 3:
             item = curr_task[2]
-            num = curr_task[3]
-            current = getattr(state, item)[ID]
-            if current >= num:
-                return False
-            if state.time[ID] <= 0:
-                return True
-            time_per_unit = min_time_per_unit.get(item)
-            if time_per_unit is not None:
-                needed = max(0, num - current)
-                if needed * time_per_unit > state.time[ID]:
+            for prev in calling_stack:
+                if isinstance(prev, (list, tuple)) and prev[0] == 'produce' and prev[2] == item:
                     return True
 
-        # Simple depth cap
-        if depth > 180:
+        # ---- Time infeasibility pruning ----
+        if tname == 'have_enough' and len(curr_task) == 4:
+            _, _, item, num = curr_task
+            cur = getattr(state, item)[ID]
+            if cur >= num:
+                return False
+            if item in min_time_per_unit:
+                needed = num - cur
+                if needed * min_time_per_unit[item] > state.time[ID]:
+                    return True
+
+        # ---- Tool usefulness pruning ----
+        if tname == 'produce' and len(curr_task) >= 3:
+            item = curr_task[2]
+
+            if item in tools:
+				# Allow producing a tool if:
+				# 1) it is a goal, or
+				# 2) it is required by a remaining task
+                is_goal = item in getattr(state, 'goals', {})
+                required_later = any(
+					isinstance(t, (list, tuple)) and item in str(t)
+					for t in tasks
+				)
+
+                if not is_goal and not required_later:
+                    return True
+
+
+
+        # Depth safety net
+        if depth > 200:
             return True
 
         return False
 
     pyhop.add_check(heuristic)
 
-
 def define_ordering(data, ID):
+    tools = set(data.get('Tools', []))
+
     def reorder_methods(state, curr_task, tasks, plan, depth, calling_stack, methods):
-        target_item = None
-        if isinstance(curr_task, (list, tuple)) and curr_task:
-            if isinstance(curr_task[0], str) and curr_task[0].startswith('produce_'):
-                target_item = curr_task[0][len('produce_'):]
         scored = []
-        fallback = []
 
         for m in methods:
             rule = getattr(m, '_rule', None)
             if not rule:
-                fallback.append(m)
+                scored.append((9999, m))
                 continue
+
             produces = rule.get('Produces', {})
             if not produces:
-                fallback.append(m)
+                scored.append((9999, m))
                 continue
+
             item = list(produces.keys())[0]
+
+            # ---- Never remake tools ----
+            if item in tools and getattr(state, item)[ID] >= 1:
+                continue
+
+            # ---- Goal tool detection (FIXED) ----
+            is_goal_tool = (
+                item in tools and
+                item in getattr(state, 'goals', {})
+            )
+
+            goal_bonus = -500 if is_goal_tool else 0
+
+            # ---- Missing required tools ----
+            missing_tools = sum(
+                1 for t, n in rule.get('Requires', {}).items()
+                if getattr(state, t)[ID] < n
+            )
+
+            # ---- Time per unit ----
             qty = produces[item]
             time_cost = rule.get('Time', 0)
-            time_per_unit = time_cost / float(qty) if qty else time_cost
-            unmet_tools = sum(1 for tool, n in rule.get('Requires', {}).items() if getattr(state, tool)[ID] < n)
+            tpu = time_cost / float(qty) if qty else time_cost
 
-            # Special prioritization for resource gathering tools
-            tool_priority = 0
-            if target_item in {'cobble', 'coal', 'ore'}:
-                for tool in rule.get('Requires', {}):
-                    if tool == 'wooden_pickaxe':
-                        tool_priority = max(tool_priority, 0)
-                    elif tool == 'stone_pickaxe':
-                        tool_priority = max(tool_priority, 1)
-                    elif tool == 'iron_pickaxe':
-                        tool_priority = max(tool_priority, 2)
-                    else:
-                        tool_priority = max(tool_priority, 3)
+            # ---- Consumption penalty ----
+            consume_penalty = sum(rule.get('Consumes', {}).values())
 
-            if target_item in {'cobble', 'coal', 'ore'}:
-                scored.append((unmet_tools, tool_priority, time_per_unit, m))
-            else:
-                scored.append((unmet_tools, time_per_unit, m))
+            score = (
+                missing_tools * 1000 +
+                tpu * 10 +
+                consume_penalty +
+                goal_bonus
+            )
 
-        # Prefer methods with no missing tools for resource gathering
-        if target_item in {'wood', 'cobble', 'coal', 'ore'} and any(s[0] == 0 for s in scored):
-            scored = [s for s in scored if s[0] == 0]
+            scored.append((score, m))
 
-        # Sort
-        if target_item in {'cobble', 'coal', 'ore'}:
-            scored.sort(key=lambda x: (x[0], x[1], x[2]))
-            return [s[3] for s in scored] + fallback
-        scored.sort(key=lambda x: (x[0], x[1]))
-        return [s[2] for s in scored] + fallback
+        scored.sort(key=lambda x: x[0])
+        return [m for _, m in scored]
 
     pyhop.define_ordering(reorder_methods)
 
