@@ -110,6 +110,9 @@ def declare_operators(data):
 # -------------------------
 
 def add_heuristic(data, ID):
+    global RELEVANT_ITEMS
+    RELEVANT_ITEMS = sorted(data['Items'] + data['Tools'] + ['time'])
+    
     min_time_per_unit = {}
     for rule in data['Recipes'].values():
         for item, qty in rule.get('Produces', {}).items():
@@ -122,16 +125,7 @@ def add_heuristic(data, ID):
     failed_memos = set()
     
     def state_signature(state):
-       # Compact, hashable snapshot
-       sig = []
-       for item in sorted(state.__dict__):
-           if item in ('__name__', 'goals'):
-               continue
-           val = state.__dict__[item]
-           if isinstance(val, dict) and ID in val:
-               sig.append((item, val[ID]))
-       return tuple(sig)
-
+       return tuple(getattr(state, item)[ID] if item != 'time' else state.time[ID] for item in RELEVANT_ITEMS)
 
     def heuristic(state, curr_task, tasks, plan, depth, calling_stack):
         # ---- Memoization prune (FAILED subproblems only) ----
