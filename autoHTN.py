@@ -1,10 +1,6 @@
 import pyhop
 import json
 
-# -------------------------
-# Core HTN tasks
-# -------------------------
-
 def check_enough(state, ID, item, num):
     if getattr(state, item)[ID] >= num:
         return []
@@ -20,10 +16,7 @@ def produce(state, ID, item):
 
 pyhop.declare_methods('produce', produce)
 
-# -------------------------
-# Method generation
-# -------------------------
-
+# Method Generator 
 def make_method(name, rule):
     produces = rule.get('Produces', {})
     if not produces:
@@ -69,10 +62,7 @@ def declare_methods(data):
         methods.sort(key=lambda x: x[1])
         pyhop.declare_methods(f'produce_{prod_item}', *[m for m, _ in methods])
 
-# -------------------------
-# Operators
-# -------------------------
-
+# Operator Generator 
 def make_operator(rule):
     def operator(state, ID):
         if state.time[ID] < rule.get('Time', 0):
@@ -105,10 +95,7 @@ def declare_operators(data):
         ops.append(op)
     pyhop.declare_operators(*ops)
 
-# -------------------------
-# Heuristic (SAFE)
-# -------------------------
-
+# Heurisitic Here - Described further in README
 def add_heuristic(data, ID):
     global RELEVANT_ITEMS
     RELEVANT_ITEMS = sorted(data['Items'] + data['Tools'] + ['time'])
@@ -128,7 +115,7 @@ def add_heuristic(data, ID):
        return tuple(getattr(state, item)[ID] if item != 'time' else state.time[ID] for item in RELEVANT_ITEMS)
 
     def heuristic(state, curr_task, tasks, plan, depth, calling_stack):
-        # ---- Memoization prune (FAILED subproblems only) ----
+        # Memoization prune
         sig = (curr_task, state_signature(state))
         if sig in failed_memos:
                 return True
@@ -138,7 +125,7 @@ def add_heuristic(data, ID):
 
         tname = curr_task[0]
 
-        # ---- Tool-only recursion guard ----
+        # Tool-only recursion guard (don't make tools we already made)
         if tname == 'produce' and len(curr_task) >= 3:
             item = curr_task[2]
             if item in tools and calling_stack:
@@ -151,7 +138,7 @@ def add_heuristic(data, ID):
                     ):
                         return True
 
-        # ---- Time infeasibility prune (ONLY at goals) ----
+        # Time infeasibility prune (ONLY at goals)
         if tname == 'have_enough' and len(curr_task) == 4:
             _, _, item, num = curr_task
             cur = getattr(state, item)[ID]
@@ -162,7 +149,7 @@ def add_heuristic(data, ID):
                 if needed * min_time_per_unit[item] > state.time[ID]:
                     return True
 
-        # ---- Depth safety ----
+        # Depth safety -> throw away plans that are too deep
         if depth > 200:
             return True
 
@@ -174,10 +161,7 @@ def add_heuristic(data, ID):
 
     pyhop.add_check(heuristic)
 
-# -------------------------
-# Method ordering
-# -------------------------
-
+#define ordering of methods - described further in README
 def define_ordering(data, ID):
     tools = set(data.get('Tools', []))
 
@@ -219,10 +203,7 @@ def define_ordering(data, ID):
 
     pyhop.define_ordering(reorder_methods)
 
-# -------------------------
 # Problem setup
-# -------------------------
-
 def set_up_state(data, ID):
     state = pyhop.State('state')
     state.time = {ID: data['Problem'].get('Time', 0)}
@@ -240,13 +221,9 @@ def set_up_goals(data, ID):
             goals.append(('have_enough', ID, item, num))
     return goals
 
-# -------------------------
-# Main
-# -------------------------
-
+# Main part!
 if __name__ == '__main__':
     import sys
-
     rules_filename = 'crafting.json'
     if len(sys.argv) > 1:
         rules_filename = sys.argv[1]
@@ -262,4 +239,10 @@ if __name__ == '__main__':
     add_heuristic(data, 'agent')
     define_ordering(data, 'agent')
 
+    # pyhop.print_operators()
+    # pyhop.print_methods()
+    
+    # Hint: verbose output can take a long time even if the solution is correct;
+    # try verbose=1 if it is taking too long
     pyhop.pyhop(state, goals, verbose=1)
+    # pyhop.pyhop(state,[('have_enough', 'agent', 'cart', 1),('have_enough','agent', 'rail', 20)], verbose=3))
